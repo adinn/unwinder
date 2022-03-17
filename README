@@ -1,0 +1,194 @@
+Prototype OpenJDK Stack Unwinder and Frame Decorator
+----------------------------------------------------
+
+This is a prototype stack unwinder/frame decorator plugin for gdb on
+Linux for use with OpenJDK7/8/9. It extends gdb so that it can unwind
+and display full stack backtrace frames for JIT-compiled Java method
+frames, interpreted Java method frames and JITted stub code frames.
+
+What Does It Do?
+----------------
+
+Normally, gdb prints plain machine addresses for JITted or interpreted
+Java frames and as often as not it fails to unwind the stack after it
+reaches a frame belonging to JITted code. Here is a stack backtrace
+without the unwinder installed.
+
+(gdb) bt 3
+#0  0x00007fffe1113484 in ?? ()
+#1  0x00007fffd3c00c18 in ?? ()
+#2  0x0000000000000000 in ?? ()
+
+
+When the unwinder is installed gdb is able to recognise Java frames
+and unwind them to find the preceding Java or C++ frame. Here is the
+backtrace for a Java Main thread and for a worker thread it has
+spawned.
+
+(gdb) thread 2
+[Switching to thread 2 (Thread 0x7ffff7fcb700 (LWP 24506))]
+#0  0x00007ffff79b5540 in pthread_cond_wait@@GLIBC_2.3.2 ()
+   from /lib64/libpthread.so.0
+(gdb) bt 10
+#0  0x00007ffff79b5540 in pthread_cond_wait@@GLIBC_2.3.2 ()
+    at /lib64/libpthread.so.0
+#1  0x00007ffff64ac82d in os::PlatformEvent::park() (this=0x7ffff0019d00)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/os/linux/vm/os_linux.cpp:5582
+#2  0x00007ffff6484f59 in ObjectMonitor::wait(long, bool, Thread*) (this=0x7fff9c008b80, millis=0, interruptible=true, __the_thread__=0x7ffff0019000)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/share/vm/runtime/objectMonitor.cpp:1490
+#3  0x00007ffff664f8cb in ObjectSynchronizer::wait(Handle, long, Thread*) (obj=..., millis=0, __the_thread__=0x7ffff0019000)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/share/vm/runtime/synchronizer.cpp:496
+#4  0x00007ffff618da54 in JVM_MonitorWait(JNIEnv*, jobject, jlong) (env=0x7ffff0019228, handle=0x7ffff7fca738, ms=0)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/share/vm/prims/jvm.cpp:614
+#5  0x00007fffe4924f62 in [interpreted: bc = 0] java.lang.Object.wait(long) ()
+    at java/lang/Object.java
+#6  0x00007fffe49034a3 in [interpreted: bc = 38] java.lang.Thread.join(long) () at java/lang/Thread.java:1352
+#7  0x00007fffe49034a3 in [interpreted: bc = 2] java.lang.Thread.join() ()
+    at java/lang/Thread.java:1426
+#8  0x00007fffe49034a3 in [interpreted: bc = 35] HelloV.main(java.lang.String) () at HelloV.java:80
+#9  0x00007fffe48f89f1 in StubRoutines (1) ()
+#10 0x00007ffff6107bb3 in JavaCalls::call_helper(JavaValue*, methodHandle const&, JavaCallArguments*, Thread*) (result=0x7ffff7fcad30, method=..., args=0x7ffff7fcac10, __the_thread__=0x7ffff0019000)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/share/vm/runtime/javaCalls.cpp:409
+(gdb) thread 26
+[Switching to thread 26 (Thread 0x7fffb415e700 (LWP 24530))]
+#0  0x00007fffe4ac82b9 in ?? ()
+(gdb) bt 5
+#0  0x00007fffe4ac82b9 in [inlined] HelloV.reader() () at HelloV.java:30
+0x00007fffe4ac82b9 in [compiled offset=0x4f9] HelloV$2.run() ()
+    at HelloV.java:72
+#1  0x00007fffe48f89f1 in StubRoutines (1) ()
+#2  0x00007ffff6107bb3 in JavaCalls::call_helper(JavaValue*, methodHandle const&, JavaCallArguments*, Thread*) (result=0x7fffb415da40, method=..., args=0x7fffb415d980, __the_thread__=0x7ffff03f2800)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/share/vm/runtime/javaCalls.cpp:409
+#3  0x00007ffff64ab409 in os::os_exception_wrapper(void (*)(JavaValue*, methodHandle const&, JavaCallArguments*, Thread*), JavaValue*, methodHandle const&, JavaCallArguments*, Thread*) (f=0x7ffff610751a <JavaCalls::call_helper(JavaValue*, methodHandle const&, JavaCallArguments*, Thread*)>, value=0x7fffb415da40, method=..., args=0x7fffb415d980, thread=0x7ffff03f2800)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/os/linux/vm/os_linux.cpp:5128
+#4  0x00007ffff6107502 in JavaCalls::call(JavaValue*, methodHandle const&, JavaCallArguments*, Thread*) (result=0x7fffb415da40, method=..., args=0x7fffb415d980, __the_thread__=0x7ffff03f2800)
+    at /home/adinn/redhat/openjdk/jdk9/hs/hotspot/src/share/vm/runtime/javaCalls.cpp:298
+(gdb)
+
+You can see that in both backtraces gdb is able to unwind the stack
+through Java frames into the underlying C call frames below the Java
+entry point. C frames are printed as usual. The text displayed for a
+Java frame varies according to whether it belongs to a compiled or
+interpreted method or to a stub.
+
+Stub frames simply display which group of stub routines the stub
+belongs to. Java method frames display the full method name, source
+file name and source line number of the method being executed in the
+frame. Interpreted frames also includes the bytecode index.  Compiled
+frames may actually include details of multiple methods because the
+current pc may be associated with inlined code. The text displayed for
+an inline method simply presents the method name, file and line
+number. The text displayed for the outer compiled method also adds the
+offset of the current instruction from the start of the compiled code.
+Note that these inline pseudo-frames are all displayed with the same
+pc address as the outer compiled frame.
+
+n.b. in case you are wondering stubs are sections of machine code
+generated to provide linkage:
+
+  from Java Virtual Machine (JVM) code written in C++ into
+  interpreted/JIT-compiled Java code (there is only one call entry
+  stub)
+
+  from Java code into JVM Code (there are a great variety of JVM
+  callouts)
+
+  from Java code into Java code (e.g. frame unwind/exception handler
+  stubs)
+
+  from Java code direct into operating system (usually C/C++) library
+  code
+
+The unwinder relies on the gdb stack unwinder API so it will only work
+with releases from gdb-7.10 onwards. Note also that your gdb should
+have been built to use python3 for preference and at the very least
+ought to be built to use python 2.7.
+
+How Do I Install It For OpenJDK8?
+---------------------------------
+
+Prerequisites
+
+You need to have installed a recent OpenJDK8 release to use this
+package. Alteratively you can use a debug release that you have built
+yourself. The current version only works on x86_64.
+
+  If it is a debug release that you have built yourself then you need
+  to ensure that the build has installed libjvm.debuginfo alongside
+  libjvm.so (see below for where this file is located)
+
+  If it is a product release which has been installed by your
+  operating system's package manager then you also need to ensure that
+  you have installed the corresponding debuginfo package. n.b. on RHEL
+  and fedora you achieve that by enabling the debug repos (in
+  /etc/yum.repos.d) and running command debuginfo-install, passing the
+  name of the installed openjdk8 package as argument. For other Linux
+  distros you consult the distro documentation for further
+  instructions.
+
+Installing
+
+You install the unwinder by copying file dbg7.py, dbg8.py or dbg.py
+(that the JDK9 version) into the server lib directory of your OpenJDK
+release. For example, with a JDK8 release on RHEL or fedora you would
+execute the following command
+
+  cp dbg8.py /etc/alternatives/java_sdk_1.8.0/jre/lib/amd64/server/libjvm.so-gdb.py
+
+n.b. the path preceding jre/lib/... may vary depending upon which
+Linux distro you are using and how java has been installed. If you
+have built your own debug build then the build subdir in your source
+tree should include a jdk image containing the required
+jre/lib/... subtree.
+
+  If you have installed a product build then you should find libjvm.so
+in this same directory.
+
+  If you are using a debug build that you have built yourself then you
+should find libjvm.so and libjvm.debuginfo in this same directory.
+
+Enabling
+--------
+
+The python unwinder only gets loaded if you set the directory you
+installed it into as safe for autoloading. To do that add this command
+to your .gdbint or run it from the gdb prompt
+
+  add-auto-load-safe-path /etc/alternatives/java_sdk_1.8.0/jre/lib/amd64/server
+
+Obviously if your install dir is different you will need to tweak that path
+
+How Do I Install It For OpenJDK7 or OpenJDK9?
+---------------------------------------------
+
+Essentially you follow the procedure described above but using the
+code in file dbg7.py instead of dbg8.py for OpenJDK7 and the code in
+dbg.py for OpenJDK9.
+
+n.b. for jdk9 you have to build your own debug build (the early access
+relases of jdk9 don't come with debug info). Also, the latest version
+of dbg.py only works with recent jdk9 releases which include the
+changes made for issue JDK-8151956 (Support non-continuous CodeBlobs
+in HotSpot). A release with a tag of b119 of greater should be fine.
+
+
+What Is Left To Do?
+-------------------
+
+The current implementation needs to be generalized to work on (at
+least) AArch64 -- maybe also x86_32.
+
+Recalculating frames when single stepping is quite slow. Caching the
+last codeblob found in CocdeCache.find_codeblob (plus its extents)
+would probably speed things up enormously.
+
+It runs into problems e.g. when it encounters a Java frame which is
+still in the Java method prologue and hence has not yet pushed a new
+frame pointer and return address.
+
+You tell me. If you have been pointed at this code you know where to
+find me.
+
+This code really needs to go upstream into OpenDJK at which point bugs
+can be reported via the OpenJDK issue tracker. That task is in
+progress.
