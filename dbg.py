@@ -64,7 +64,12 @@ class Types(object):
     voidp_t = void_t.pointer()
 
     codeblobp_t = gdb.lookup_type('CodeBlob').pointer()
-    cmethodp_t = gdb.lookup_type('CompiledMethod').pointer()
+    # JDK9+
+    cmethodp_t = None
+    try:
+        cmethodp_t = gdb.lookup_type('CompiledMethod').pointer()
+    except gdb.error:
+        pass
     nmethodp_t = gdb.lookup_type('nmethod').pointer()
 
     ptrp_t = voidp_t.pointer()
@@ -177,7 +182,11 @@ class CodeHeap:
         self.class_init()
         # if we got here we are ok to create a new instance
         self.heap = heap
-        self.name = str(heap['_name'])
+        # JDK9+
+        try:
+            self.name = str(heap['_name'])
+        except gdb.error:
+            self.name = "codeheap"
         self.lo = Types.as_long(heap['_memory']['_low_boundary'])
         self.hi = Types.as_long(heap['_memory']['_high_boundary'])
         self.segmap = heap['_segmap']
@@ -271,6 +280,7 @@ class CodeCache:
         # t("CodeCache.class_init")
         if cls.class_inited:
             return
+
         # t("if cls.lo  == 0 or cls.hi == 0:")
         if cls.lo == 0 or cls.hi == 0:
             try:
@@ -286,39 +296,53 @@ class CodeCache:
                 # debug_write("@@ CodeCache::_high_bound = 0x%x\n" % cls.hi)
                 if cls.hi == 0:
                     return
-            except Exception as arg:
+            except gdb.error as arg:
                 # debug_write("@@ %s\n" % arg)
                 cls.lo = 0
                 cls.hi = 0
-                cls.class_inited = False
-                raise
+                # It is OK for <=JDK8
 
         # t("f cls.heap_list == []:")
         if cls.heap_list == []:
             try:
-                # t("heaps = gdb.parse_and_eval(\"CodeCache::_heaps\")")
-                heaps = gdb.parse_and_eval("CodeCache::_heaps")
-                # debug_write("@@ CodeCache::_heaps (%s) = 0x%x\n" % (heaps.type, heaps))
-                # t("len = int(heaps['_len'])")
-                len = int(heaps['_len'])
-                # debug_write("@@ CodeCache::_heaps->_len = %d\n" % len)
-                # t("data = heaps['_data']")
-                data = heaps['_data']
-                # debug_write("@@ CodeCache::_heaps->_data = 0x%x\n" % data)
-                # t("for i in range(0, len):")
-                for i in range(0, len):
-                    # t("heap = CodeHeap((data + i).dereference())")
-                    heap = CodeHeap((data + i).dereference())
+                try:
+                    # t("heaps = gdb.parse_and_eval(\"CodeCache::_heap\")")
+                    heaps = [gdb.parse_and_eval("CodeCache::_heap")]
+                except gdb.error:
+                    # t("heaps = gdb.parse_and_eval(\"CodeCache::_heaps\")")
+                    # debug_write("@@ CodeCache::_heaps (%s) = 0x%x\n" % (heaps.type, heaps))
+                    # t("len = int(heaps['_len'])")
+                    # debug_write("@@ CodeCache::_heaps->_len = %d\n" % len)
+                    # debug_write("@@ CodeCache::_heaps->_data = 0x%x\n" % heaps['_data'])
+                    heaps = [gdb.parse_and_eval("CodeCache::_heaps->_data[" + str(heapi) + "]")
+                             for heapi in range(gdb.parse_and_eval("CodeCache::_heaps->_len"))]
+                for heap in heaps:
+                    if Types.as_long(heap) == 0:
+                        raise gdb.GdbError("dbg.CodeCache.class_init : heap not ready!")
                     # t("cls.heap_list.append(heap)")
-                    cls.heap_list.append(heap)
+                    cls.heap_list.append(CodeHeap(heap))
                     # t("cls.heap_count += 1")
                     cls.heap_count += 1
+                    # <=JDK8
+                    if cls.lo == 0 and cls.hi == 0:
+                        lo = heap['_memory']['_low_boundary']
+                        # debug_write("@@ lo = 0x%x\n" % lo)
+                        cls.lo = Types.as_long(lo)
+                        if Types.as_long(lo) == 0:
+                            raise gdb.GdbError("dbg.CodeCache.class_init : lo not ready!")
+                        hi = heap['_memory']['_high_boundary']
+                        # debug_write("@@ hi = 0x%x\n" % hi)
+                        if Types.as_long(hi) == 0:
+                            raise gdb.GdbError("dbg.CodeCache.class_init : hi not ready!")
+                        cls.hi = Types.as_long(hi)
+                        
             except Exception as arg:
                 # debug_write("@@ %s\n" % arg)
                 cls.heap_list = []
                 cls.heap_count = 0
                 cls.class_inited = False
                 raise
+
         cls.class_inited = True
 
     @classmethod
@@ -384,7 +408,11 @@ class FrameConstants(object):
         cls._interpreter_frame_sender_sp_offset = int(gdb.parse_and_eval("frame::interpreter_frame_sender_sp_offset"))
         cls._sender_sp_offset = int(gdb.parse_and_eval("frame::sender_sp_offset"))
         cls._interpreter_frame_method_offset = int(gdb.parse_and_eval("frame::interpreter_frame_method_offset"))
-        cls._interpreter_frame_bcp_offset = int(gdb.parse_and_eval("frame::interpreter_frame_bcp_offset"))
+        # JDK9+
+        try:
+            cls._interpreter_frame_bcp_offset = int(gdb.parse_and_eval("frame::interpreter_frame_bcp_offset"))
+        except gdb.error:
+            cls._interpreter_frame_bcp_offset = int(gdb.parse_and_eval("frame::interpreter_frame_bcx_offset"))
         # only set if we got here with no errors
         cls.class_inited = True
     @classmethod
@@ -495,14 +523,21 @@ class MethodBCIReader:
         self.nmethod = nmethod
         self.method = method
         # debug_write("nmethod (%s) = 0x%x\n" % (str(nmethod.type), Types.as_long(nmethod)))
-        blob = Types.to_type(nmethod, Types.codeblobp_t);
-        self.code_begin = Types.as_long(blob['_code_begin'])
-        self.code_end = Types.as_long(blob['_code_end'])
+        header_begin = Types.cast_bytep(nmethod)
+        # JDK9+
+        try:
+            blob = Types.to_type(nmethod, Types.codeblobp_t);
+            self.code_begin = Types.as_long(blob['_code_begin'])
+            self.code_end = Types.as_long(blob['_code_end'])
+        except gdb.error:
+            code_begin_offset = Types.as_int(nmethod['_code_offset'])
+            code_end_offset = Types.as_int(nmethod['_data_offset'])
+            self.code_begin = Types.as_long(header_begin + code_begin_offset)
+            self.code_end = Types.as_long(header_begin + code_end_offset)
         scopes_pcs_begin_offset = Types.as_int(nmethod['_scopes_pcs_offset'])
         # debug_write("scopes_pcs_begin_offset = 0x%x\n" % scopes_pcs_begin_offset)
         scopes_pcs_end_offset = Types.as_int(nmethod['_dependencies_offset'])
         # debug_write("scopes_pcs_end_offset = 0x%x\n" % scopes_pcs_end_offset)
-        header_begin = Types.cast_bytep(nmethod)
         self.scopes_pcs_begin = self.as_pcdesc_p(header_begin + scopes_pcs_begin_offset)
         # debug_write("scopes_pcs_begin (%s) = 0x%x\n" % (str(self.scopes_pcs_begin.type), Types.as_long(self.scopes_pcs_begin)))
         self.scopes_pcs_end = self.as_pcdesc_p(header_begin + scopes_pcs_end_offset)
@@ -516,6 +551,9 @@ class MethodBCIReader:
         # non-empty table always starts with lower as a sentinel with
         # offset -1 and will have at least one real offset beyond that
         next = lower + 1
+        # JDK8: hotspot/src/share/vm/code/nmethod.cpp
+        # JDK11: src/hotspot/share/code/nmethod.cpp
+        # match_desc(): pc_offset <= pc->pc_offset()
         while next < upper and next['_pc_offset'] <= pc_off:
             next = next + 1
         # use the last known bci below this pc
@@ -529,9 +567,12 @@ class MethodBCIReader:
         # debug_write("nmethod = 0x%x\n" % nmethod)
         # debug_write("pc_desc = 0x%x\n" % Types.as_long(pc_desc))
         base = Types.cast_bytep(nmethod)
-        # scopes_data_offset = Types.as_int(nmethod['_scopes_data_offset'])
-        # scopes_base = base + scopes_data_offset
-        scopes_base = nmethod['_scopes_data_begin']
+        # JDK9+
+        try:
+            scopes_base = nmethod['_scopes_data_begin']
+        except gdb.error:
+            scopes_data_offset = Types.as_int(nmethod['_scopes_data_offset'])
+            scopes_base = base + scopes_data_offset
         # debug_write("scopes_base = 0x%x\n" % Types.as_long(scopes_base))
         metadata_offset = Types.as_int(nmethod['_metadata_offset'])
         metadata_base = Types.to_type(base + metadata_offset, self.metadata_pp)
@@ -883,12 +924,21 @@ class CompiledMethodInfo(JavaMethodInfo):
         # t("CompiledMethodInfo.__init__")
         super(CompiledMethodInfo,self).__init__(entry)
         blob = self.blob
-        cmethod = Types.to_type(blob, Types.cmethodp_t)
         nmethod = Types.to_type(blob, Types.nmethodp_t)
-        self.methodptr = cmethod['_method']
+        if Types.cmethodp_t is not None:
+            cmethod = Types.to_type(blob, Types.cmethodp_t)
+            self.methodptr = cmethod['_method']
+        else:
+            self.methodptr = nmethod['_method']
         const_method = self.methodptr['_constMethod']
         bcbase = Types.cast_bytep(const_method + 1)
-        self.code_begin = Types.as_long(blob['_code_begin'])
+        # JDK9+
+        try:
+            self.code_begin = Types.as_long(blob['_code_begin'])
+        except gdb.error:
+            header_begin = Types.cast_bytep(nmethod)
+            code_begin_offset = Types.as_int(nmethod['_code_offset'])
+            self.code_begin = Types.as_long(header_begin + code_begin_offset)
         # get bc and line number info from method
         self.cache_method_info()
         # get PC to BCI translator from the nmethod
@@ -947,12 +997,21 @@ class NativeMethodInfo(JavaMethodInfo):
         # t("NativeMethodInfo.__init__")
         super(NativeMethodInfo,self).__init__(entry)
         blob = self.blob
-        cmethod = Types.to_type(blob, Types.cmethodp_t)
         nmethod = Types.to_type(blob, Types.nmethodp_t)
-        self.methodptr = cmethod['_method']
+        if Types.cmethodp_t is not None:
+            cmethod = Types.to_type(blob, Types.cmethodp_t)
+            self.methodptr = cmethod['_method']
+        else:
+            self.methodptr = nmethod['_method']
         const_method = self.methodptr['_constMethod']
         bcbase = Types.cast_bytep(const_method + 1)
-        self.code_begin = Types.as_long(blob['_code_begin'])
+        # JDK9+
+        try:
+            self.code_begin = Types.as_long(blob['_code_begin'])
+        except gdb.error:
+            header_begin = Types.cast_bytep(nmethod)
+            code_begin_offset = Types.as_int(nmethod['_code_offset'])
+            self.code_begin = Types.as_long(header_begin + code_begin_offset)
         # get bc and line number info from method
         self.cache_method_info()
 
@@ -985,7 +1044,7 @@ class InterpretedMethodInfo(JavaMethodInfo):
         # debug_write("@@ bcbase = 0x%x\n" % Types.as_long(bcbase))
         bcp_offset = FrameConstants.interpreter_frame_bcp_offset() * 8
         if bcp is None:
-            # interpreter frames store bytecodeptr in slot 8
+            # interpreter frames store bytecodeptr in (<=JDK8 slot 7 | >=JDK9 slot 8)
             bcp_addr = gdb.Value((self.bp + bcp_offset) & 0xffffffffffffffff)
             bcp_val = Types.cast_bytep(Types.load_ptr(bcp_addr))
         else:
@@ -1156,7 +1215,8 @@ class OpenJDKUnwinder(Unwinder):
             # debug_write("@@ compiled %s\n" % name)
             codetype = 'compiled'
             # TODO -- need to check if frame is complete
-            # i.e. if ((char *)pc - (char *)blob) > blob['_code_begin'] + blob['_frame_complete_offset']
+            # i.e. if <=JDK8: ((char *)pc - (char *)blob) > blob['_header_size'] + blob['_code_offset'] + blob['_frame_complete_offset']
+            # i.e. if >=JDK9: ((char *)pc - (char *)blob) > blob['_code_begin'] + blob['_frame_complete_offset']
             # if not then we have not pushed a frame.
             # what do we do then? use SP as BP???
             frame_size = blob['_frame_size']
