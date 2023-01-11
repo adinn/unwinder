@@ -150,6 +150,16 @@ class Types(object):
     def to_ptrp(cls, x):
         return cls.to_type(x, cls.ptrp_t)
 
+    # return 8 for 64-bit and 4 for 32-bit arch
+    @classmethod
+    def word_size(cls):
+        return cls.voidp_t.sizeof
+
+    # return 0xffffffffffffffff for 64-bit and 0xffffffff for 32-bit arch
+    @classmethod
+    def word_mask(cls):
+        return (1 << (cls.word_size() * 8)) - 1
+
 # OpenJDK specific classes which understand the layout of the code
 # heap and know how to translate a PC to an associated code blob and,
 # from there to a method object. n.b. in some cases the latter step
@@ -705,13 +715,13 @@ class Method(object):
             klass_path = klass_path[0:dollaridx]
         self.klass_path = klass_path + ".java"
         method_idx = const_method['_name_index']
-        method_sym = (constant_pool_base + (8 * method_idx)).cast(gdb.lookup_type("Symbol").pointer().pointer()).dereference()
+        method_sym = (constant_pool_base + (Types.word_size() * method_idx)).cast(gdb.lookup_type("Symbol").pointer().pointer()).dereference()
         method_name = method_sym['_body'].cast(gdb.lookup_type("char").pointer())
         method_name_length = int(method_sym['_length'])
         self.method_str =  CodeCache.makestr(method_name_length, method_name)
 
         sig_idx = const_method['_signature_index']
-        sig_sym = (constant_pool_base + (8 * sig_idx)).cast(gdb.lookup_type("Symbol").pointer().pointer()).dereference()
+        sig_sym = (constant_pool_base + (Types.word_size() * sig_idx)).cast(gdb.lookup_type("Symbol").pointer().pointer()).dereference()
         sig_name = sig_sym['_body'].cast(gdb.lookup_type("char").pointer())
         sig_name_length = int(sig_sym['_length'])
         sig_str = CodeCache.makestr(sig_name_length, sig_name)
@@ -824,8 +834,8 @@ class OpenJDKFrameFilter(object):
             return [ frame ]
         # t("base = frame.inferior_frame()")
         base = frame.inferior_frame()
-        # t("sp = Types.as_long(base.read_register('rsp'))")
-        sp = base.read_register('rsp')
+        # t("sp = Types.as_long(base.read_register('sp'))")
+        sp = base.read_register(self.unwinder.register(base, 'sp'))
         x = Types.as_long(sp)
         # debug_write("@@ get info at unwindercache[0x%x]\n" % x)
         try:
@@ -1034,18 +1044,18 @@ class InterpretedMethodInfo(JavaMethodInfo):
     def __init__(self, entry, bcp):
         super(InterpretedMethodInfo,self).__init__(entry)
         # interpreter frames store methodptr in slot 3
-        methodptr_offset = FrameConstants.interpreter_frame_method_offset() * 8
-        methodptr_addr = gdb.Value((self.bp + methodptr_offset) & 0xffffffffffffffff)
+        methodptr_offset = FrameConstants.interpreter_frame_method_offset() * Types.word_size()
+        methodptr_addr = gdb.Value((self.bp + methodptr_offset) & Types.word_mask())
         methodptr_slot = methodptr_addr.cast(gdb.lookup_type("Method").pointer().pointer())
         self.methodptr = methodptr_slot.dereference()
         # bytecode immediately follows const method
         const_method = self.methodptr['_constMethod']
         bcbase = Types.cast_bytep(const_method + 1)
         # debug_write("@@ bcbase = 0x%x\n" % Types.as_long(bcbase))
-        bcp_offset = FrameConstants.interpreter_frame_bcp_offset() * 8
+        bcp_offset = FrameConstants.interpreter_frame_bcp_offset() * Types.word_size()
         if bcp is None:
             # interpreter frames store bytecodeptr in (<=JDK8 slot 7 | >=JDK9 slot 8)
-            bcp_addr = gdb.Value((self.bp + bcp_offset) & 0xffffffffffffffff)
+            bcp_addr = gdb.Value((self.bp + bcp_offset) & Types.word_mask())
             bcp_val = Types.cast_bytep(Types.load_ptr(bcp_addr))
         else:
             bcp_val =  Types.cast_bytep(bcp)
@@ -1054,7 +1064,7 @@ class InterpretedMethodInfo(JavaMethodInfo):
             bcoff = Types.as_long(bcp_val - bcbase)
             if bcoff < 0 or bcoff >= 0x10000:
                 # use the value in the frame slot
-                bcp_addr = gdb.Value((self.bp + bcp_offset) & 0xffffffffffffffff)
+                bcp_addr = gdb.Value((self.bp + bcp_offset) & Types.word_mask())
                 bcp_val = Types.cast_bytep(Types.load_ptr(bcp_addr))
         self.bcoff = Types.as_long(bcp_val - bcbase)
         # debug_write("@@ bcoff = 0x%x\n" % self.bcoff)
@@ -1125,6 +1135,16 @@ class OpenJDKUnwinder(Unwinder):
         self.unwindercache = {}
         self.invocations = {}
 
+    def register(self, pending_frame, name):
+        arch = pending_frame.architecture().name()
+        if arch == "i386:x86-64":
+            regs = {"pc": "rip", "sp": "rsp", "bp": "rbp", "bcp": "r13"}
+        elif arch == "i386":
+            regs = {"pc": "eip", "sp": "esp", "bp": "ebp", "bcp": "esi"}
+        else:
+            raise gdb.GdbError("dbg: Unsupported architecture %s!" % arch)
+        return regs[name]
+
     # the method that gets called by the pyuw_sniffer
     def __call__(self, pending_frame):
         # sometimes when we call into python gdb routines
@@ -1153,11 +1173,11 @@ class OpenJDKUnwinder(Unwinder):
     def call_sub(self, pending_frame):
         # t("OpenJDKUnwinder.__call_sub__")
         # debug_write("@@ reading pending frame registers\n")
-        pc = pending_frame.read_register('rip')
+        pc = pending_frame.read_register(self.register(pending_frame, 'pc'))
         # debug_write("@@ pc = 0x%x\n" % Types.as_long(pc))
-        sp = pending_frame.read_register('rsp')
+        sp = pending_frame.read_register(self.register(pending_frame, 'sp'))
         # debug_write("@@ sp = 0x%x\n" % Types.as_long(sp))
-        bp = pending_frame.read_register('rbp')
+        bp = pending_frame.read_register(self.register(pending_frame, 'bp'))
         # debug_write("@@ bp = 0x%x\n" % Types.as_long(bp))
         try:
             if not CodeCache.inrange(pc):
@@ -1184,7 +1204,7 @@ class OpenJDKUnwinder(Unwinder):
         # (i.e. one that we have already unwound) then rbp will not be
         # present. that's ok because the frame decorator can still
         # find the latest bcp value on the stack.
-        bcp = pending_frame.read_register('r13')
+        bcp = pending_frame.read_register(self.register(pending_frame, 'bcp'))
         try:
             # convert returned value to a python int to force a check that
             # the register is defined. if not this will except
@@ -1222,7 +1242,7 @@ class OpenJDKUnwinder(Unwinder):
             frame_size = blob['_frame_size']
             # debug_write("@@ frame_size = 0x%x\n" % int(frame_size))
             # n.b. frame_size includes stacked rbp and rip hence the -2
-            bp = sp + ((frame_size - 2) * 8)
+            bp = sp + ((frame_size - 2) * Types.word_size())
             # debug_write("@@ revised bp = 0x%x\n" % Types.as_long(bp))
         elif name == "native nmethod":
             # debug_write("@@ native %s \n" % name)
@@ -1242,17 +1262,17 @@ class OpenJDKUnwinder(Unwinder):
         self.unwindercache[x] = OpenJDKUnwinderCacheEntry(blob, sp, pc, bp, bcp, name, codetype)
         # t("next_bp = Types.load_long(bp)")
         next_bp = Types.load_long(bp)
-        # t("next_pc = Types.load_long(bp + 8)")
-        next_pc = Types.load_long(bp + 8)
+        # t("next_pc = Types.load_long(bp + Types.word_size())")
+        next_pc = Types.load_long(bp + Types.word_size())
         # next_sp is normally just 2 words below current bp
         # but for interpreted frames we need to skip locals
         # so we pull caller_sp from the frame
         if codetype == "interpreted":
-            interpreter_frame_sender_sp_offset = FrameConstants.interpreter_frame_sender_sp_offset() * 8
+            interpreter_frame_sender_sp_offset = FrameConstants.interpreter_frame_sender_sp_offset() * Types.word_size()
             # interpreter frames store sender sp in slot 1
             next_sp = Types.load_long(bp + interpreter_frame_sender_sp_offset)
         else:
-            sender_sp_offset = FrameConstants.sender_sp_offset() * 8
+            sender_sp_offset = FrameConstants.sender_sp_offset() * Types.word_size()
             next_sp = bp + sender_sp_offset
         # create unwind info for this frame
         # t("frameid = OpenJDKFrameId(...)")
@@ -1269,9 +1289,9 @@ class OpenJDKUnwinder(Unwinder):
         #
         # for now we only add the minimum of registers that we know
         # are valid.
-        unwind_info.add_saved_register('rip', next_pc)
-        unwind_info.add_saved_register('rsp', next_sp)
-        unwind_info.add_saved_register('rbp', next_bp)
+        unwind_info.add_saved_register(self.register(pending_frame, 'pc'), next_pc)
+        unwind_info.add_saved_register(self.register(pending_frame, 'sp'), next_sp)
+        unwind_info.add_saved_register(self.register(pending_frame, 'bp'), next_bp)
         if _dump_frame:
             debug_write("next pc = 0x%x\n" % Types.as_long(next_pc))
             debug_write("next sp = 0x%x\n" % Types.as_long(next_sp))
